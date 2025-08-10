@@ -1,0 +1,1072 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>학생 누가 기록부 (수정됨)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+    <script>
+    // Simple DOCX generation utility (no external dependency)
+    const docx = (() => {
+        const AlignmentType = { CENTER: 'center', START: 'start', END: 'end' };
+
+        function escapeXML(str) {
+            return str.replace(/[<>&'"]/g, (c) => {
+                switch (c) {
+                    case '<': return '&lt;';
+                    case '>': return '&gt;';
+                    case '&': return '&amp;';
+                    case "'": return "&apos;";
+                    case '"': return "&quot;";
+                }
+            });
+        }
+
+        class TextRun {
+            constructor(options) {
+                this.text = options.text || '';
+                this.bold = options.bold || false;
+                this.size = options.size || 22; // Default size 11pt
+            }
+            render() {
+                const sizeNode = `<w:sz w:val="${this.size}"/>`;
+                const boldNode = this.bold ? '<w:b/>' : '';
+                return `<w:r><w:rPr>${boldNode}${sizeNode}</w:rPr><w:t xml:space="preserve">${escapeXML(this.text)}</w:t></w:r>`;
+            }
+        }
+
+        class Paragraph {
+            constructor(options) {
+                this.children = options.children || [];
+                this.alignment = options.alignment || AlignmentType.START;
+                this.spacing = options.spacing || {};
+            }
+            render() {
+                const alignNode = this.alignment ? `<w:jc w:val="${this.alignment}"/>` : '';
+                const spacingNode = this.spacing.after ? `<w:spacing w:after="${this.spacing.after}"/>` : '';
+                const childrenXml = this.children.map(c => c.render()).join('');
+                return `<w:p><w:pPr>${alignNode}${spacingNode}</w:pPr>${childrenXml}</w:p>`;
+            }
+        }
+
+        class TableCell {
+            constructor(options) {
+                this.children = options.children || [];
+                this.width = options.width;
+                this.margins = options.margins;
+            }
+            render() {
+                const childrenXml = this.children.map(c => c.render()).join('');
+                let widthNode = '';
+                if (this.width && this.width.size && this.width.type) {
+                    const widthVal = this.width.type === 'pct' ? this.width.size * 50 : this.width.size;
+                    widthNode = `<w:tcW w:w="${widthVal}" w:type="${this.width.type}"/>`;
+                }
+                let marginNode = '';
+                if (this.margins) {
+                    const left = this.margins.left ? `<w:left w:w="${this.margins.left}" w:type="dxa"/>` : '';
+                    const right = this.margins.right ? `<w:right w:w="${this.margins.right}" w:type="dxa"/>` : '';
+                    if (left || right) {
+                        marginNode = `<w:tcMar>${left}${right}</w:tcMar>`;
+                    }
+                }
+                return `<w:tc><w:tcPr>${widthNode}${marginNode}</w:tcPr>${childrenXml}</w:tc>`;
+            }
+        }
+
+        class TableRow {
+            constructor(options) {
+                this.children = options.children || [];
+            }
+            render() {
+                const cellsXml = this.children.map(c => c.render()).join('');
+                return `<w:tr>${cellsXml}</w:tr>`;
+            }
+        }
+
+        class Table {
+            constructor(options) {
+                this.rows = options.rows || [];
+                this.width = options.width || { size: 100, type: 'pct' };
+            }
+            render() {
+                const rowsXml = this.rows.map(r => r.render()).join('');
+                const gridCols = this.rows[0] ? this.rows[0].children.map(cell => {
+                    if (!cell.width || !cell.width.size || !cell.width.type) return '';
+                    const widthVal = cell.width.type === 'pct' ? cell.width.size * 50 : cell.width.size;
+                    return `<w:gridCol w:w="${widthVal}"/>`;
+                }).join('') : '';
+                
+                const tblW = this.width.type === 'pct' ? this.width.size * 50 : this.width.size;
+
+                return `<w:tbl>
+                    <w:tblPr>
+                        <w:tblW w:w="${tblW}" w:type="${this.width.type}"/>
+                        <w:tblBorders>
+                            <w:top w:val="single" w:sz="4" w:space="0" w:color="auto"/>
+                            <w:left w:val="single" w:sz="4" w:space="0" w:color="auto"/>
+                            <w:bottom w:val="single" w:sz="4" w:space="0" w:color="auto"/>
+                            <w:right w:val="single" w:sz="4" w:space="0" w:color="auto"/>
+                            <w:insideH w:val="single" w:sz="4" w:space="0" w:color="auto"/>
+                            <w:insideV w:val="single" w:sz="4" w:space="0" w:color="auto"/>
+                        </w:tblBorders>
+                    </w:tblPr>
+                    <w:tblGrid>${gridCols}</w:tblGrid>
+                    ${rowsXml}
+                </w:tbl>`;
+            }
+        }
+
+        class Document {
+            constructor(options) {
+                this.sections = options.sections || [];
+            }
+            render() {
+                const section = this.sections[0]; // Assuming one section
+                const childrenXml = section.children.map(c => c.render()).join('');
+                return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>${childrenXml}</w:body></w:document>`;
+            }
+        }
+
+        const Packer = {
+            toBlob: (doc) => {
+                return new Promise((resolve, reject) => {
+                    try {
+                        if (typeof JSZip === 'undefined') {
+                           return reject(new Error('JSZip library is not loaded.'));
+                        }
+                        const zip = new JSZip();
+                        const docXml = doc.render();
+                        zip.file('[Content_Types].xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>`);
+                        zip.file('_rels/.rels', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>`);
+                        zip.file('word/document.xml', docXml);
+
+                        zip.generateAsync({ type: 'blob' }).then(resolve).catch(reject);
+                    } catch (e) {
+                        reject(e);
+                    }
+                });
+            }
+        };
+
+        return { Document, Packer, Paragraph, TextRun, AlignmentType, Table, TableRow, TableCell };
+    })();
+    </script>
+    <style>
+        /* 기본 폰트 및 애니메이션 설정 */
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+        .page {
+            display: none;
+            animation: fadeIn 0.5s ease-in-out;
+        }
+        .page.active {
+            display: block;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.5);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            animation: fadeIn 0.2s ease-in-out;
+        }
+        .notification {
+            position: fixed;
+            top: 1.25rem;
+            right: 1.25rem;
+            z-index: 1100;
+            animation: slideIn 0.3s ease-out;
+        }
+        @keyframes slideIn {
+            from { transform: translateX(100%); }
+            to { transform: translateX(0); }
+        }
+    </style>
+</head>
+<body class="bg-gray-100 text-gray-800">
+
+    <div id="loading-spinner" class="fixed inset-0 bg-white bg-opacity-75 flex justify-center items-center z-50">
+        <div class="animate-spin rounded-full h-32 w-32 border-t-2 border-b-2 border-blue-500"></div>
+    </div>
+
+    <div class="container mx-auto p-4 max-w-4xl">
+        <!-- 홈 페이지 -->
+        <div id="home-page" class="page active">
+            <div class="text-center">
+                <h1 class="text-4xl font-bold mb-2 text-blue-600">누가 기록부 프로그램</h1>
+                <p class="text-gray-500 mb-12">학생들의 소중한 순간들을 기록하고 관리하세요.</p>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                    <button data-page="manage-page" class="page-btn p-8 bg-white rounded-xl shadow-md hover:shadow-xl hover:-translate-y-1 transition-all duration-300 flex flex-col items-center text-center">
+                        <i data-lucide="users" class="w-12 h-12 mb-4 text-blue-500"></i>
+                        <h2 class="text-2xl font-bold mt-2 mb-2">학생 관리</h2>
+                        <p class="text-gray-500">학생을 추가, 수정, 삭제합니다.</p>
+                    </button>
+                    <button data-page="log-page" class="page-btn p-8 bg-white rounded-xl shadow-md hover:shadow-xl hover:-translate-y-1 transition-all duration-300 flex flex-col items-center text-center">
+                        <i data-lucide="book" class="w-12 h-12 mb-4 text-blue-500"></i>
+                        <h2 class="text-2xl font-bold mt-2 mb-2">누가기록 작성</h2>
+                        <p class="text-gray-500">학생의 일지를 작성하고 저장합니다.</p>
+                    </button>
+                    <button data-page="search-page" class="page-btn p-8 bg-white rounded-xl shadow-md hover:shadow-xl hover:-translate-y-1 transition-all duration-300 flex flex-col items-center text-center">
+                        <i data-lucide="search" class="w-12 h-12 mb-4 text-blue-500"></i>
+                        <h2 class="text-2xl font-bold mt-2 mb-2">누가기록 검색</h2>
+                        <p class="text-gray-500">작성된 기록을 검색하고 관리합니다.</p>
+                    </button>
+                </div>
+                <div class="mt-16 pt-8 border-t">
+                    <div class="flex flex-col sm:flex-row justify-center items-center gap-4">
+                        <button id="import-btn" class="w-full sm:w-auto bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700 transition-colors duration-300 flex items-center justify-center gap-3 shadow-lg hover:shadow-xl">
+                            <i data-lucide="upload" class="w-5 h-5"></i> 데이터 불러오기
+                        </button>
+                        <button id="export-btn" class="w-full sm:w-auto bg-gray-700 text-white px-6 py-3 rounded-lg hover:bg-gray-800 transition-colors duration-300 flex items-center justify-center gap-3 shadow-lg hover:shadow-xl">
+                            <i data-lucide="download" class="w-5 h-5"></i> 모든 데이터 저장하기
+                        </button>
+                    </div>
+                    <input type="file" id="file-input" accept=".json" class="hidden">
+                    <p class="text-sm text-gray-500 mt-4">로컬 컴퓨터의 JSON 파일에서 데이터를 불러오거나, 현재 데이터를 저장(백업)합니다.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- 학생 관리 페이지 -->
+        <div id="manage-page" class="page">
+            <div class="p-6 bg-white rounded-xl shadow-lg">
+                <div class="flex items-center gap-4 mb-6">
+                    <button class="back-btn p-2 rounded-full hover:bg-gray-200 transition"><i data-lucide="chevron-left" class="w-6 h-6"></i></button>
+                    <h2 class="text-3xl font-bold text-gray-800">학생 관리</h2>
+                </div>
+                <div class="mb-8">
+                    <h3 class="text-xl font-semibold mb-4 border-b pb-2">새 학생 추가</h3>
+                    <form id="add-student-form" class="flex flex-col md:flex-row gap-4 items-end">
+                        <div class="flex-1 w-full"><label class="block text-sm font-medium text-gray-600 mb-1">학년</label><input type="text" id="new-student-grade" placeholder="예: 1" class="w-full p-2 border rounded-md focus:ring-2 focus:ring-blue-500 transition" required></div>
+                        <div class="flex-1 w-full"><label class="block text-sm font-medium text-gray-600 mb-1">반</label><input type="text" id="new-student-class" placeholder="예: 3" class="w-full p-2 border rounded-md focus:ring-2 focus:ring-blue-500 transition" required></div>
+                        <div class="flex-1 w-full"><label class="block text-sm font-medium text-gray-600 mb-1">이름</label><input type="text" id="new-student-name" placeholder="예: 홍길동" class="w-full p-2 border rounded-md focus:ring-2 focus:ring-blue-500 transition" required></div>
+                        <button type="submit" class="w-full md:w-auto bg-blue-500 text-white px-6 py-2 rounded-md hover:bg-blue-600 transition duration-200 flex items-center justify-center gap-2"><i data-lucide="user-plus" class="w-4 h-4"></i> 추가</button>
+                    </form>
+                </div>
+                <div>
+                    <h3 class="text-xl font-semibold mb-4 border-b pb-2">학생 목록</h3>
+                    <div id="students-list" class="space-y-3 max-h-96 overflow-y-auto pr-2"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 누가기록 작성 페이지 -->
+        <div id="log-page" class="page">
+             <div class="p-6 bg-white rounded-xl shadow-lg">
+                <div class="flex justify-between items-center mb-6">
+                    <div class="flex items-center gap-4">
+                        <button class="back-btn p-2 rounded-full hover:bg-gray-200 transition"><i data-lucide="chevron-left" class="w-6 h-6"></i></button>
+                        <h2 class="text-3xl font-bold text-gray-800">누가기록 작성/수정</h2>
+                    </div>
+                    <button id="save-log-btn" class="bg-green-500 text-white px-6 py-2 rounded-md hover:bg-green-600 transition flex items-center gap-2"><i data-lucide="save" class="w-4 h-4"></i> 저장하기</button>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
+                    <div class="md:col-span-1">
+                        <label class="block text-sm font-medium text-gray-600 mb-1">학생 선택</label>
+                        <select id="log-student-select" class="w-full p-2 border rounded-md focus:ring-2 focus:ring-blue-500 transition"></select>
+                    </div>
+                    <div class="md:col-span-2">
+                        <label class="block text-sm font-medium text-gray-600 mb-1">날짜 선택</label>
+                        <input type="date" id="log-date" class="w-full p-2 border rounded-md focus:ring-2 focus:ring-blue-500 transition">
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-600 mb-1">내용</label>
+                    <textarea id="log-content" placeholder="여기에 내용을 입력하세요..." class="w-full h-80 p-3 border rounded-md focus:ring-2 focus:ring-blue-500 transition"></textarea>
+                </div>
+            </div>
+        </div>
+
+        <!-- 기록 검색 페이지 -->
+        <div id="search-page" class="page">
+            <div class="p-6 bg-white rounded-xl shadow-lg">
+                <div class="flex items-center gap-4 mb-6">
+                    <button class="back-btn p-2 rounded-full hover:bg-gray-200 transition"><i data-lucide="chevron-left" class="w-6 h-6"></i></button>
+                    <h2 class="text-3xl font-bold text-gray-800">누가기록 검색</h2>
+                </div>
+                <div class="p-4 border rounded-lg mb-6 bg-gray-50">
+                    <h3 class="font-semibold mb-3">검색 조건</h3>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <div>
+                            <div class="flex justify-between items-center mb-2">
+                                <label class="text-sm font-medium text-gray-600">학생 선택</label>
+                                <button id="search-clear-student" class="px-3 py-1 text-xs rounded-full border transition-colors bg-white text-gray-600 border-gray-300">선택 해제</button>
+                            </div>
+                            <div id="search-students-list" class="flex flex-wrap gap-2 p-2 border rounded-md bg-white min-h-[40px]"></div>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-600 mb-2">날짜 범위</label>
+                            <div class="flex items-center gap-2">
+                                <input type="date" id="search-start-date" class="w-full p-2 border rounded-md">
+                                <span>~</span>
+                                <input type="date" id="search-end-date" class="w-full p-2 border rounded-md">
+                            </div>
+                        </div>
+                    </div>
+                    <button id="search-btn" class="mt-4 w-full bg-blue-500 text-white p-2 rounded-md hover:bg-blue-600 transition flex items-center justify-center gap-2"><i data-lucide="search" class="w-4 h-4"></i> 검색</button>
+                </div>
+                <div class="flex justify-between items-center mb-4 flex-wrap gap-2">
+                    <div class="flex items-center gap-4">
+                        <h3 class="text-xl font-semibold">검색 결과 (<span id="search-results-count">0</span>건)</h3>
+                        <div class="flex items-center">
+                            <input type="checkbox" id="search-select-all-logs" class="mr-2 h-4 w-4">
+                            <label for="search-select-all-logs">전체 선택 (<span id="selected-logs-count">0</span>개 선택됨)</label>
+                        </div>
+                    </div>
+                    <div class="flex gap-2">
+                        <button id="export-word-btn" class="bg-blue-500 text-white px-4 py-2 rounded-md hover:bg-blue-600 transition flex items-center gap-2 disabled:bg-gray-400 disabled:cursor-not-allowed" disabled>
+                            <i data-lucide="file-down" class="w-4 h-4"></i> 선택 항목 Word 저장
+                        </button>
+                        <button id="bulk-delete-btn" class="bg-red-500 text-white px-4 py-2 rounded-md hover:bg-red-600 transition flex items-center gap-2">
+                            <i data-lucide="trash-2" class="w-4 h-4"></i> 일괄 삭제
+                        </button>
+                    </div>
+                </div>
+                <div id="search-results-list" class="space-y-3 max-h-[50vh] overflow-y-auto pr-2"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal & Notification Area -->
+    <div id="modal-area"></div>
+    <div id="notification-area"></div>
+    
+    <script>
+        (function() {
+            'use strict';
+
+            // --- App State ---
+            let students = [];
+            let logs = [];
+            let currentPage = 'home-page';
+            let navigationHistory = [];
+            let editingLogData = null;
+            let searchStateCache = null;
+
+            // --- UI Elements ---
+            const pages = document.querySelectorAll('.page');
+            const loadingSpinner = document.getElementById('loading-spinner');
+
+            // --- Data Persistence ---
+            const saveData = () => {
+                try {
+                    localStorage.setItem('students', JSON.stringify(students));
+                    localStorage.setItem('logs', JSON.stringify(logs));
+                } catch (e) {
+                    console.error("Error saving data to localStorage", e);
+                    showNotification("데이터 저장에 실패했습니다. 브라우저 설정 확인이 필요합니다.", "error");
+                }
+            };
+
+            const loadData = () => {
+                try {
+                    const storedStudents = localStorage.getItem('students');
+                    const storedLogs = localStorage.getItem('logs');
+                    students = storedStudents ? JSON.parse(storedStudents) : [];
+                    logs = storedLogs ? JSON.parse(storedLogs) : [];
+                    students.sort((a, b) => a.name.localeCompare(b.name, 'ko'));
+                } catch (e) {
+                    console.error("Error loading data from localStorage", e);
+                    students = [];
+                    logs = [];
+                    showNotification("데이터 불러오기에 실패했습니다.", "error");
+                }
+            };
+
+            const generateId = () => `id_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+            // --- Utility Functions ---
+            const showNotification = (message, type = 'success') => {
+                const notifArea = document.getElementById('notification-area');
+                const notifId = `notif-${Date.now()}`;
+                const bgColor = type === 'error' ? 'bg-red-100' : 'bg-green-100';
+                const textColor = type === 'error' ? 'text-red-800' : 'text-green-800';
+                const icon = type === 'error' ? 'alert-circle' : 'check-circle';
+
+                const notifHTML = `
+                    <div id="${notifId}" class="notification p-4 rounded-md shadow-lg flex items-center gap-3 ${bgColor} ${textColor}">
+                        <i data-lucide="${icon}" class="w-5 h-5"></i>
+                        <span>${message}</span>
+                    </div>
+                `;
+                notifArea.insertAdjacentHTML('beforeend', notifHTML);
+                lucide.createIcons();
+                setTimeout(() => {
+                    document.getElementById(notifId)?.remove();
+                }, 3000);
+            };
+
+            const showConfirmModal = (title, message, onConfirm, confirmText = '삭제', confirmColor = 'bg-red-500 hover:bg-red-600') => {
+                const modalArea = document.getElementById('modal-area');
+                const modalId = `modal-${Date.now()}`;
+                const modalHTML = `
+                    <div id="${modalId}" class="modal-overlay">
+                        <div class="bg-white p-8 rounded-lg shadow-2xl w-full max-w-md m-4 animate-fadeIn">
+                            <h3 class="text-xl font-bold mb-4">${title}</h3>
+                            <p class="text-gray-600 mb-6 whitespace-pre-wrap">${message}</p>
+                            <div class="flex justify-end gap-3">
+                                <button data-action="cancel" class="px-4 py-2 bg-gray-200 rounded-md hover:bg-gray-300">취소</button>
+                                <button data-action="confirm" class="px-4 py-2 text-white rounded-md ${confirmColor}">${confirmText}</button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                modalArea.innerHTML = modalHTML;
+                document.getElementById(modalId).addEventListener('click', (e) => {
+                    if (e.target.dataset.action === 'confirm') {
+                        onConfirm();
+                        modalArea.innerHTML = '';
+                    } else if (e.target.dataset.action === 'cancel' || e.target.classList.contains('modal-overlay')) {
+                        modalArea.innerHTML = '';
+                    }
+                });
+            };
+
+            const showEditStudentModal = (student) => {
+                const modalArea = document.getElementById('modal-area');
+                const modalHTML = `
+                    <div class="modal-overlay">
+                        <form id="edit-student-form" class="bg-white p-8 rounded-lg shadow-2xl w-full max-w-md m-4 animate-fadeIn">
+                            <h3 class="text-xl font-bold mb-6">학생 정보 수정</h3>
+                            <div class="space-y-4">
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-600 mb-1">학년</label>
+                                    <input type="text" name="grade" value="${student.grade}" class="w-full p-2 border rounded-md" required>
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-600 mb-1">반</label>
+                                    <input type="text" name="classNum" value="${student.classNum}" class="w-full p-2 border rounded-md" required>
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-600 mb-1">이름</label>
+                                    <input type="text" name="name" value="${student.name}" class="w-full p-2 border rounded-md" required>
+                                </div>
+                            </div>
+                            <div class="mt-8 flex justify-end gap-3">
+                                <button type="button" data-action="cancel" class="px-4 py-2 bg-gray-200 rounded-md hover:bg-gray-300">취소</button>
+                                <button type="submit" class="px-4 py-2 bg-blue-500 text-white rounded-md hover:bg-blue-600">저장</button>
+                            </div>
+                        </form>
+                    </div>
+                `;
+                modalArea.innerHTML = modalHTML;
+                
+                const form = document.getElementById('edit-student-form');
+                form.addEventListener('submit', (e) => {
+                    e.preventDefault();
+                    const formData = new FormData(form);
+                    const studentIndex = students.findIndex(s => s.id === student.id);
+                    if (studentIndex > -1) {
+                        students[studentIndex].grade = formData.get('grade');
+                        students[studentIndex].classNum = formData.get('classNum');
+                        students[studentIndex].name = formData.get('name');
+                        students.sort((a, b) => a.name.localeCompare(b.name, 'ko'));
+                        saveData();
+                        renderStudentsList();
+                    }
+                    modalArea.innerHTML = '';
+                    showNotification('학생 정보가 수정되었습니다.');
+                });
+
+                form.querySelector('[data-action="cancel"]').addEventListener('click', () => {
+                    modalArea.innerHTML = '';
+                });
+            };
+
+            // --- Rendering Functions ---
+            const renderStudentsList = () => {
+                const listEl = document.getElementById('students-list');
+                if (!listEl) return;
+                if (students.length === 0) {
+                    listEl.innerHTML = `<p class="text-gray-500 text-center py-4">등록된 학생이 없습니다.</p>`;
+                    return;
+                }
+                listEl.innerHTML = students.map(s => `
+                    <div class="flex justify-between items-center p-3 bg-gray-50 rounded-lg hover:bg-gray-100 transition group">
+                        <p class="font-medium">${s.grade}학년 ${s.classNum}반 ${s.name}</p>
+                        <div class="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                            <button data-action="edit" data-id="${s.id}" class="p-2 text-gray-500 hover:text-blue-600"><i data-lucide="edit" class="w-4 h-4 pointer-events-none"></i></button>
+                            <button data-action="delete" data-id="${s.id}" class="p-2 text-gray-500 hover:text-red-600"><i data-lucide="trash-2" class="w-4 h-4 pointer-events-none"></i></button>
+                        </div>
+                    </div>
+                `).join('');
+                lucide.createIcons();
+            };
+
+            const renderLogPageSelect = () => {
+                const selectEl = document.getElementById('log-student-select');
+                if (!selectEl) return;
+                const currentVal = selectEl.value;
+                selectEl.innerHTML = '<option value="">학생 선택...</option>' + students.map(s => `<option value="${s.id}">${s.grade}학년 ${s.classNum}반 ${s.name}</option>`).join('');
+                if (students.some(s => s.id === currentVal)) {
+                    selectEl.value = currentVal;
+                }
+            };
+            
+            const renderSearchPage = () => {
+                const studentListEl = document.getElementById('search-students-list');
+                if (!studentListEl) return;
+                const selectedStudentId = searchStateCache ? searchStateCache.selectedStudent : null;
+                studentListEl.innerHTML = students.map(s => `
+                    <button data-id="${s.id}" class="student-toggle-btn px-3 py-1.5 rounded-lg text-sm transition-colors duration-200 ${selectedStudentId === s.id ? 'bg-blue-500 text-white font-semibold shadow-sm' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}">
+                        ${s.name}
+                    </button>
+                `).join('');
+            };
+
+            const renderSearchResults = (results) => {
+                const listEl = document.getElementById('search-results-list');
+                const countEl = document.getElementById('search-results-count');
+                if (!listEl || !countEl) return;
+                
+                countEl.textContent = results.length;
+                
+                if (results.length === 0) {
+                    listEl.innerHTML = `<p class="text-gray-500 text-center py-8">검색 결과가 없습니다.</p>`;
+                    return;
+                }
+                
+                const studentInfoMap = students.reduce((acc, student) => {
+                    acc[student.id] = `${student.grade}학년 ${student.classNum}반 ${student.name}`;
+                    return acc;
+                }, {});
+
+                listEl.innerHTML = results.map(log => `
+                    <div class="p-4 border rounded-lg hover:shadow-md transition flex items-start gap-3">
+                        <input type="checkbox" data-log-id="${log.id}" class="log-select-checkbox mt-1 h-4 w-4">
+                        <div class="flex-grow">
+                            <div class="flex justify-between items-start">
+                                <div>
+                                    <p class="font-bold text-blue-700">${studentInfoMap[log.studentId] || '알 수 없는 학생'}</p>
+                                    <p class="text-sm text-gray-500"><i data-lucide="calendar" class="inline-block w-3.5 h-3.5 mr-1"></i>${log.date}</p>
+                                </div>
+                                <div class="flex gap-2">
+                                    <button data-action="edit-log" data-id="${log.id}" class="p-2 text-gray-500 hover:text-blue-600"><i data-lucide="edit" class="w-4 h-4 pointer-events-none"></i></button>
+                                    <button data-action="delete-log" data-id="${log.id}" class="p-2 text-gray-500 hover:text-red-600"><i data-lucide="trash-2" class="w-4 h-4 pointer-events-none"></i></button>
+                                </div>
+                            </div>
+                            <p class="mt-2 text-gray-700 bg-gray-50 p-2 rounded-md whitespace-pre-wrap break-words">${log.content || '내용 없음'}</p>
+                        </div>
+                    </div>
+                `).join('');
+                lucide.createIcons();
+            };
+
+            const renderAllPages = () => {
+                renderStudentsList();
+                renderLogPageSelect();
+                renderSearchPage();
+                if (currentPage === 'search-page' && searchStateCache) {
+                    document.getElementById('search-btn').click();
+                }
+            };
+
+            const showPage = (pageId, isBack = false) => {
+                if (!isBack && currentPage !== pageId) {
+                    navigationHistory.push(currentPage);
+                }
+                
+                pages.forEach(page => page.classList.toggle('active', page.id === pageId));
+                currentPage = pageId;
+                window.scrollTo(0, 0);
+                
+                switch (currentPage) {
+                    case 'manage-page':
+                        renderStudentsList();
+                        break;
+                    case 'log-page':
+                        renderLogPageSelect();
+                        setupLogPageUI();
+                        break;
+                    case 'search-page':
+                        renderSearchPage();
+                        if (searchStateCache) {
+                            document.getElementById('search-start-date').value = searchStateCache.startDate;
+                            document.getElementById('search-end-date').value = searchStateCache.endDate;
+                            document.getElementById('search-btn').click();
+                        }
+                        break;
+                }
+            };
+
+            const setupLogPageUI = () => {
+                const studentSelect = document.getElementById('log-student-select');
+                const dateInput = document.getElementById('log-date');
+                const contentInput = document.getElementById('log-content');
+                
+                if (editingLogData) {
+                    studentSelect.value = editingLogData.studentId;
+                    dateInput.value = editingLogData.date;
+                    contentInput.value = editingLogData.content;
+                } else {
+                    studentSelect.value = studentSelect.options[1]?.value || '';
+                    dateInput.value = new Date().toISOString().slice(0, 10);
+                    contentInput.value = '';
+                }
+                studentSelect.dispatchEvent(new Event('change'));
+            };
+
+            // --- Event Handlers & Logic ---
+            const setupHomePage = () => {
+                document.getElementById('export-btn').addEventListener('click', () => {
+                    const data = {
+                        students: students,
+                        logs: logs
+                    };
+                    const filename = 'nugagirokbu-data.json';
+                    if (students.length === 0 && logs.length === 0) {
+                        showNotification('내보낼 데이터가 없습니다.', 'error');
+                        return;
+                    }
+                    const jsonString = `data:text/json;charset=utf-8,${encodeURIComponent(JSON.stringify(data, null, 2))}`;
+                    const link = document.createElement("a");
+                    link.href = jsonString;
+                    link.download = filename;
+                    link.click();
+                    showNotification('데이터를 성공적으로 저장했습니다.');
+                });
+
+                document.getElementById('import-btn').addEventListener('click', () => {
+                    const fileInput = document.getElementById('file-input');
+                    fileInput.accept = '.json';
+                    fileInput.multiple = false;
+                    fileInput.click();
+                });
+
+                document.getElementById('file-input').addEventListener('change', (event) => {
+                    const file = event.target.files[0];
+                    if (!file) return;
+
+                    const reader = new FileReader();
+                    reader.onload = (e) => {
+                        try {
+                            const data = JSON.parse(e.target.result);
+                            if (data && data.students && data.logs) {
+                                showConfirmModal(
+                                    '데이터 불러오기',
+                                    '정말로 데이터를 불러오시겠습니까?\n현재 저장된 모든 데이터가 선택한 파일의 내용으로 대체됩니다.',
+                                    () => {
+                                        students = data.students.map(s => ({...s, id: s.id || generateId()}));
+                                        logs = data.logs.map(l => ({...l, id: l.id || generateId()}));
+                                        saveData();
+                                        loadData(); // to re-sort and apply
+                                        renderAllPages();
+                                        showNotification("데이터를 성공적으로 불러왔습니다!");
+                                    },
+                                    '불러오기',
+                                    'bg-blue-600 hover:bg-blue-700'
+                                );
+                            } else {
+                                showNotification('파일 형식이 올바르지 않습니다.', 'error');
+                            }
+                        } catch (err) {
+                            showNotification('파일을 읽는 중 오류가 발생했습니다.', 'error');
+                        }
+                    };
+                    reader.readAsText(file);
+                    event.target.value = null;
+                });
+            };
+
+            const setupStudentManagementPage = () => {
+                const form = document.getElementById('add-student-form');
+                form.addEventListener('submit', (e) => {
+                    e.preventDefault();
+                    const newStudent = {
+                        id: generateId(),
+                        grade: document.getElementById('new-student-grade').value,
+                        classNum: document.getElementById('new-student-class').value,
+                        name: document.getElementById('new-student-name').value,
+                    };
+                    if (newStudent.grade && newStudent.classNum && newStudent.name) {
+                        students.push(newStudent);
+                        students.sort((a, b) => a.name.localeCompare(b.name, 'ko'));
+                        saveData();
+                        renderStudentsList();
+                        renderLogPageSelect();
+                        renderSearchPage();
+                        form.reset();
+                    }
+                });
+
+                document.getElementById('students-list').addEventListener('click', (e) => {
+                    const button = e.target.closest('button');
+                    if (!button) return;
+
+                    const { action, id } = button.dataset;
+                    const student = students.find(s => s.id === id);
+
+                    if (action === 'delete') {
+                        showConfirmModal('학생 삭제', `'${student.name}' 학생을 정말로 삭제하시겠습니까?\n관련된 모든 누가 기록도 함께 삭제됩니다.`, () => {
+                            students = students.filter(s => s.id !== id);
+                            logs = logs.filter(l => l.studentId !== id);
+                            saveData();
+                            renderAllPages();
+                            showNotification('학생 정보가 삭제되었습니다.');
+                        });
+                    } else if (action === 'edit') {
+                        showEditStudentModal(student);
+                    }
+                });
+            };
+            
+            const setupLogPage = () => {
+                const studentSelect = document.getElementById('log-student-select');
+                const dateInput = document.getElementById('log-date');
+                const contentInput = document.getElementById('log-content');
+                
+                const loadLog = () => {
+                    const log = logs.find(l => l.studentId === studentSelect.value && l.date === dateInput.value);
+                    contentInput.value = log ? log.content : '';
+                };
+
+                studentSelect.addEventListener('change', loadLog);
+                dateInput.addEventListener('change', loadLog);
+
+                document.getElementById('save-log-btn').addEventListener('click', () => {
+                    const student = students.find(s => s.id === studentSelect.value);
+                    if (!student) {
+                        showNotification('학생을 선택해주세요.', 'error');
+                        return;
+                    }
+                    const logData = {
+                        studentId: studentSelect.value,
+                        date: dateInput.value,
+                        content: contentInput.value,
+                    };
+
+                    let existingLog = logs.find(l => l.studentId === logData.studentId && l.date === logData.date);
+
+                    if (existingLog) {
+                        existingLog.content = logData.content;
+                    } else {
+                        existingLog = { ...logData, id: generateId() };
+                        logs.push(existingLog);
+                    }
+                    
+                    saveData();
+                    showNotification('성공적으로 저장되었습니다!');
+                    
+                    if (editingLogData) {
+                        editingLogData = { ...existingLog };
+                    }
+                });
+            };
+
+            const setupSearchPage = () => {
+                let selectedStudentId = null;
+                let selectedLogIds = new Set();
+                let currentSearchResults = [];
+
+                const studentsListEl = document.getElementById('search-students-list');
+                
+                studentsListEl.addEventListener('click', (e) => {
+                    const btn = e.target.closest('.student-toggle-btn');
+                    if (!btn) return;
+                    const id = btn.dataset.id;
+                    const isCurrentlySelected = btn.classList.contains('bg-blue-500');
+                    
+                    studentsListEl.querySelectorAll('.student-toggle-btn').forEach(b => {
+                        b.classList.remove('bg-blue-500', 'text-white', 'font-semibold', 'shadow-sm');
+                        b.classList.add('bg-gray-100', 'text-gray-700');
+                    });
+
+                    if (!isCurrentlySelected) {
+                        btn.classList.add('bg-blue-500', 'text-white', 'font-semibold', 'shadow-sm');
+                        btn.classList.remove('bg-gray-100', 'text-gray-700');
+                        selectedStudentId = id;
+                    } else {
+                        selectedStudentId = null;
+                    }
+                });
+                
+                document.getElementById('search-clear-student')?.addEventListener('click', () => {
+                    selectedStudentId = null;
+                    studentsListEl.querySelectorAll('.student-toggle-btn').forEach(b => {
+                        b.classList.remove('bg-blue-500', 'text-white', 'font-semibold', 'shadow-sm');
+                        b.classList.add('bg-gray-100', 'text-gray-700');
+                    });
+                });
+
+                document.getElementById('search-btn').addEventListener('click', () => {
+                    const startDate = document.getElementById('search-start-date').value;
+                    const endDate = document.getElementById('search-end-date').value;
+
+                    searchStateCache = {
+                        selectedStudent: selectedStudentId,
+                        startDate,
+                        endDate,
+                    };
+
+                    let results = logs;
+                    if (selectedStudentId) {
+                        results = results.filter(log => log.studentId === selectedStudentId);
+                    }
+                    if (startDate) results = results.filter(log => log.date >= startDate);
+                    if (endDate) results = results.filter(log => log.date <= endDate);
+
+                    const studentNameMap = students.reduce((map, student) => {
+                        map[student.id] = student.name;
+                        return map;
+                    }, {});
+
+                    results.sort((a, b) => {
+                        const nameA = studentNameMap[a.studentId] || '';
+                        const nameB = studentNameMap[b.studentId] || '';
+                        if (nameA.localeCompare(nameB, 'ko') !== 0) return nameA.localeCompare(nameB, 'ko');
+                        return new Date(b.date) - new Date(a.date);
+                    });
+                    
+                    currentSearchResults = results;
+                    renderSearchResults(results);
+                    selectedLogIds.clear();
+                    updateSelectedLogsCount();
+                });
+
+                const resultsListEl = document.getElementById('search-results-list');
+                resultsListEl.addEventListener('click', (e) => {
+                    const logCheckbox = e.target.closest('.log-select-checkbox');
+                    const editBtn = e.target.closest('[data-action="edit-log"]');
+                    const deleteBtn = e.target.closest('[data-action="delete-log"]');
+
+                    if (logCheckbox) {
+                        const logId = logCheckbox.dataset.logId;
+                        if (logCheckbox.checked) {
+                            selectedLogIds.add(logId);
+                        } else {
+                            selectedLogIds.delete(logId);
+                        }
+                        updateSelectedLogsCount();
+                    } else if (editBtn) {
+                        editingLogData = logs.find(l => l.id === editBtn.dataset.id);
+                        showPage('log-page');
+                    } else if (deleteBtn) {
+                        const log = logs.find(l => l.id === deleteBtn.dataset.id);
+                        const student = students.find(s => s.id === log.studentId);
+                        showConfirmModal('기록 삭제', `'${student?.name || '알 수 없는 학생'}'의 '${log.date}' 기록을 정말로 삭제하시겠습니까?`, () => {
+                            logs = logs.filter(l => l.id !== log.id);
+                            saveData();
+                            document.getElementById('search-btn').click();
+                            showNotification('기록이 삭제되었습니다.');
+                        });
+                    }
+                });
+                
+                const updateSelectedLogsCount = () => {
+                    const countEl = document.getElementById('selected-logs-count');
+                    if(countEl) countEl.textContent = selectedLogIds.size;
+                    
+                    const exportBtn = document.getElementById('export-word-btn');
+                    if(exportBtn) exportBtn.disabled = selectedLogIds.size === 0;
+
+                    const selectAllCheckbox = document.getElementById('search-select-all-logs');
+                    if(selectAllCheckbox) selectAllCheckbox.checked = currentSearchResults.length > 0 && selectedLogIds.size === currentSearchResults.length;
+                };
+
+                document.getElementById('search-select-all-logs').addEventListener('change', (e) => {
+                    if (e.target.checked) {
+                        selectedLogIds = new Set(currentSearchResults.map(l => l.id));
+                    } else {
+                        selectedLogIds.clear();
+                    }
+                    resultsListEl.querySelectorAll('.log-select-checkbox').forEach(cb => cb.checked = e.target.checked);
+                    updateSelectedLogsCount();
+                });
+
+                document.getElementById('export-word-btn').addEventListener('click', () => {
+                    try {
+                        if (typeof docx === 'undefined') {
+                            showNotification('Word 내보내기 라이브러리를 불러오지 못했습니다. 인터넷 연결을 확인해주세요.', 'error');
+                            console.error('docx library is not loaded.');
+                            return;
+                        }
+
+                        if (selectedLogIds.size === 0) {
+                            showNotification('Word로 저장할 기록을 선택해주세요.', 'error');
+                            return;
+                        }
+
+                        const selectedLogs = logs.filter(log => selectedLogIds.has(log.id));
+                        
+                        if (selectedLogs.length === 0) {
+                            showNotification('선택된 기록을 찾을 수 없습니다.', 'error');
+                            return;
+                        }
+
+                        const firstStudentId = selectedLogs[0].studentId;
+                        const allSameStudent = selectedLogs.every(log => log.studentId === firstStudentId);
+
+                        if (!allSameStudent) {
+                            showNotification('한 학생의 기록만 선택하여 내보낼 수 있습니다.', 'error');
+                            return;
+                        }
+
+                        const student = students.find(s => s.id === firstStudentId);
+                        if (!student) {
+                            showNotification('학생 정보를 찾을 수 없습니다.', 'error');
+                            return;
+                        }
+
+                        selectedLogs.sort((a, b) => new Date(a.date) - new Date(b.date));
+
+                        const { Document, Packer, Paragraph, TextRun, AlignmentType, Table, TableRow, TableCell } = docx;
+
+                        const tableRows = [
+                            new TableRow({
+                                children: [
+                                    new TableCell({
+                                        children: [new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: "날짜", bold: true })] })],
+                                        width: { size: 20, type: 'pct' },
+                                        margins: { left: 100, right: 100 }
+                                    }),
+                                    new TableCell({
+                                        children: [new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: "기록 내용", bold: true })] })],
+                                        width: { size: 80, type: 'pct' },
+                                        margins: { left: 100, right: 100 }
+                                    })
+                                ]
+                            })
+                        ];
+
+                        selectedLogs.forEach(log => {
+                            tableRows.push(new TableRow({
+                                children: [
+                                    new TableCell({
+                                        children: [new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: log.date })] })],
+                                        width: { size: 20, type: 'pct' },
+                                        margins: { left: 100, right: 100 }
+                                    }),
+                                    new TableCell({
+                                        children: (log.content || "내용 없음").split('\n').map(line => new Paragraph({ children: [ new TextRun({ text: line }) ] })),
+                                        width: { size: 80, type: 'pct' },
+                                        margins: { left: 100, right: 100 }
+                                    })
+                                ]
+                            }));
+                        });
+
+                        const doc = new Document({
+                            sections: [{
+                                properties: {},
+                                children: [
+                                    new Paragraph({
+                                        children: [
+                                            new TextRun({
+                                                text: "누가기록부",
+                                                bold: true,
+                                                size: 48, // 24pt
+                                            }),
+                                        ],
+                                        alignment: AlignmentType.CENTER,
+                                        spacing: { after: 300 },
+                                    }),
+                                    new Paragraph({
+                                        children: [
+                                            new TextRun({
+                                                text: `${student.grade}학년 ${student.classNum}반 ${student.name}`,
+                                                size: 24, // 12pt
+                                            }),
+                                        ],
+                                        alignment: AlignmentType.END, // 오른쪽 정렬
+                                        spacing: { after: 600 },
+                                    }),
+                                    new Table({
+                                        width: { size: 100, type: 'pct' },
+                                        rows: tableRows
+                                    })
+                                ],
+                            }],
+                        });
+
+                        Packer.toBlob(doc).then(blob => {
+                            const link = document.createElement('a');
+                            const url = URL.createObjectURL(blob);
+                            link.href = url;
+                            const today = new Date();
+                            const formattedDate = `${today.getFullYear()}-${(today.getMonth() + 1).toString().padStart(2, '0')}-${today.getDate().toString().padStart(2, '0')}`;
+                            link.download = `누가기록부_${student.name}_${formattedDate}.docx`;
+                            document.body.appendChild(link);
+                            link.click();
+                            document.body.removeChild(link);
+                            URL.revokeObjectURL(url);
+                            showNotification('Word 파일이 성공적으로 생성되었습니다.');
+                        }).catch(err => {
+                            console.error("Error creating Word document:", err);
+                            showNotification('Word 파일 생성 중 오류가 발생했습니다.', 'error');
+                        });
+
+                    } catch (err) {
+                        console.error("An unexpected error occurred in the export function:", err);
+                        showNotification('예상치 못한 오류가 발생했습니다. 개발자 도구를 확인해주세요.', 'error');
+                    }
+                });
+
+                document.getElementById('bulk-delete-btn').addEventListener('click', () => {
+                    if (selectedLogIds.size === 0) {
+                        showNotification('삭제할 기록을 선택해주세요.', 'error');
+                        return;
+                    }
+                    showConfirmModal('일괄 삭제', `선택된 ${selectedLogIds.size}개의 기록을 정말로 삭제하시겠습니까?`, () => {
+                        logs = logs.filter(l => !selectedLogIds.has(l.id));
+                        saveData();
+                        document.getElementById('search-btn').click();
+                        showNotification(`${selectedLogIds.size}개의 기록이 삭제되었습니다.`);
+                    });
+                });
+            };
+
+            // --- App Initialization ---
+            const init = () => {
+                lucide.createIcons();
+                
+                document.querySelectorAll('.page-btn').forEach(btn => {
+                    btn.addEventListener('click', () => {
+                        editingLogData = null;
+                        if (btn.dataset.page !== 'search-page') {
+                            searchStateCache = null;
+                        }
+                        showPage(btn.dataset.page);
+                    });
+                });
+
+                document.querySelectorAll('.back-btn').forEach(btn => {
+                    btn.addEventListener('click', () => {
+                        editingLogData = null;
+                        const lastPage = navigationHistory.pop();
+                        showPage(lastPage || 'home-page', true);
+                    });
+                });
+
+                loadData();
+                setupHomePage();
+                setupStudentManagementPage();
+                setupLogPage();
+                setupSearchPage();
+                
+                renderAllPages();
+                showPage('home-page', true);
+
+                loadingSpinner.style.display = 'none';
+            };
+
+            document.addEventListener('DOMContentLoaded', init);
+
+        })();
+    </script>
+</body>
+</html>
